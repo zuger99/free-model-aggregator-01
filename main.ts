@@ -38,6 +38,7 @@ import {
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 const PROBE_TIMEOUT_MS = 5000;
+const UPSTREAM_TIMEOUT_MS = 15000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -221,6 +222,7 @@ async function callUpstreamOpenAI(
       method: 'POST',
       headers,
       body: JSON.stringify({ ...body, model: route.model.id }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
     if (!upstream.ok) {
       return { ok: false, status: upstream.status, text: await upstream.text(), wire };
