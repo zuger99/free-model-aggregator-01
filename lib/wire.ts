@@ -386,6 +386,11 @@ export function openAIToGeminiRequest(body: Json): Json {
   if (typeof body.temperature === 'number') genConfig.temperature = body.temperature;
   if (typeof body.top_p === 'number') genConfig.topP = body.top_p;
   if (typeof body.max_tokens === 'number') genConfig.maxOutputTokens = body.max_tokens;
+  if (Array.isArray(body.stop) && body.stop.length > 0) {
+    genConfig.stopSequences = body.stop.filter((s): s is string => typeof s === 'string');
+  } else if (typeof body.stop === 'string' && body.stop !== '') {
+    genConfig.stopSequences = [body.stop];
+  }
   if (isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
     genConfig.responseMimeType = 'application/json';
   }
@@ -463,6 +468,8 @@ export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8A
   let callId = '';
   let callName = '';
   let toolIndex = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -483,7 +490,9 @@ export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8A
             continue;
           }
           if (!isRecord(eventObj)) continue;
-          if (eventObj.type === 'content_block_start' && isRecord(eventObj.content_block)) {
+          if (eventObj.type === 'message_start' && isRecord(eventObj.message) && isRecord(eventObj.message.usage)) {
+            inputTokens = numberOrZero(eventObj.message.usage.input_tokens);
+          } else if (eventObj.type === 'content_block_start' && isRecord(eventObj.content_block)) {
             if (eventObj.content_block.type === 'tool_use') {
               callId = typeof eventObj.content_block.id === 'string' ? eventObj.content_block.id : `call_${toolIndex}`;
               callName = typeof eventObj.content_block.name === 'string' ? eventObj.content_block.name : '';
@@ -544,6 +553,9 @@ export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8A
           } else if (eventObj.type === 'content_block_stop') {
             toolIndex += 1;
           } else if (eventObj.type === 'message_delta' && isRecord(eventObj.delta)) {
+            if (isRecord(eventObj.usage)) {
+              outputTokens = numberOrZero(eventObj.usage.output_tokens);
+            }
             const fr = eventObj.delta.stop_reason === 'tool_use' ? 'tool_calls' : eventObj.delta.stop_reason === 'max_tokens' ? 'length' : 'stop';
             yield sseEvent(null, {
               id: 'chatcmpl_stream',
@@ -553,6 +565,18 @@ export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8A
               choices: [{ index: 0, delta: {}, finish_reason: fr }],
             });
           } else if (eventObj.type === 'message_stop') {
+            yield sseEvent(null, {
+              id: 'chatcmpl_stream',
+              object: 'chat.completion.chunk',
+              created: FIXED_OPENAI_CREATED,
+              model,
+              choices: [],
+              usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+              },
+            });
             yield 'data: [DONE]\n\n';
           }
         }
@@ -710,4 +734,237 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     for (const event of startEvents()) yield event;
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
+}
+
+/** OpenAI SSE events from Gemini SSE Stream */
+export async function* openAIEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sawFinish = false;
+  let promptTokens = 0;
+  let completionTokens = 0;
+
+  yield sseEvent(null, {
+    id: 'chatcmpl_gemini_stream',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+  });
+
+  const processLine = (line: string): string[] => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return [];
+    const payload = trimmed.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') return [];
+    let obj: unknown;
+    try {
+      obj = JSON.parse(payload);
+    } catch {
+      return [];
+    }
+    if (!isRecord(obj)) return [];
+    const out: string[] = [];
+
+    if (isRecord(obj.usageMetadata)) {
+      const u = obj.usageMetadata as Record<string, unknown>;
+      if (typeof u.promptTokenCount === 'number') promptTokens = u.promptTokenCount;
+      if (typeof u.candidatesTokenCount === 'number') completionTokens = u.candidatesTokenCount;
+    }
+
+    const candidates = Array.isArray(obj.candidates) ? obj.candidates : [];
+    const candidate = isRecord(candidates[0]) ? candidates[0] : null;
+    if (candidate !== null) {
+      const content = isRecord(candidate.content) ? candidate.content : {};
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      for (const p of parts) {
+        if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+          out.push(
+            sseEvent(null, {
+              id: 'chatcmpl_gemini_stream',
+              object: 'chat.completion.chunk',
+              created: FIXED_OPENAI_CREATED,
+              model,
+              choices: [{ index: 0, delta: { content: p.text }, finish_reason: null }],
+            })
+          );
+        }
+      }
+      if (typeof candidate.finishReason === 'string' && !sawFinish) {
+        sawFinish = true;
+        const fr = candidate.finishReason === 'MAX_TOKENS' ? 'length' : 'stop';
+        out.push(
+          sseEvent(null, {
+            id: 'chatcmpl_gemini_stream',
+            object: 'chat.completion.chunk',
+            created: FIXED_OPENAI_CREATED,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: fr }],
+          })
+        );
+      }
+    }
+    return out;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          for (const ev of processLine(line)) yield ev;
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const line of buffer.split('\n')) {
+        for (const ev of processLine(line)) yield ev;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!sawFinish) {
+    yield sseEvent(null, {
+      id: 'chatcmpl_gemini_stream',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    });
+  }
+
+  yield sseEvent(null, {
+    id: 'chatcmpl_gemini_stream',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+  });
+
+  yield 'data: [DONE]\n\n';
+}
+
+/** Anthropic SSE events from Gemini SSE Stream */
+export async function* anthropicEventsFromGemini(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  estimatedInputTokens: number = 0
+): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let outputTokens = 0;
+  let fullText = '';
+
+  yield sseEvent('message_start', {
+    type: 'message_start',
+    message: {
+      id: 'msg_gemini_stream',
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: estimatedInputTokens, output_tokens: 0 },
+    },
+  });
+
+  yield sseEvent('content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  });
+
+  const processLine = (line: string): string[] => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return [];
+    const payload = trimmed.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') return [];
+    let obj: unknown;
+    try {
+      obj = JSON.parse(payload);
+    } catch {
+      return [];
+    }
+    if (!isRecord(obj)) return [];
+    const out: string[] = [];
+
+    if (isRecord(obj.usageMetadata)) {
+      const u = obj.usageMetadata as Record<string, unknown>;
+      if (typeof u.candidatesTokenCount === 'number') outputTokens = u.candidatesTokenCount;
+    }
+
+    const candidates = Array.isArray(obj.candidates) ? obj.candidates : [];
+    const candidate = isRecord(candidates[0]) ? candidates[0] : null;
+    if (candidate !== null) {
+      const content = isRecord(candidate.content) ? candidate.content : {};
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      for (const p of parts) {
+        if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+          fullText += p.text;
+          out.push(
+            sseEvent('content_block_delta', {
+              type: 'content_block_delta',
+              index: 0,
+              delta: { type: 'text_delta', text: p.text },
+            })
+          );
+        }
+      }
+    }
+    return out;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          for (const ev of processLine(line)) yield ev;
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const line of buffer.split('\n')) {
+        for (const ev of processLine(line)) yield ev;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (outputTokens === 0) {
+    outputTokens = Math.max(1, Math.floor(fullText.length / 4));
+  }
+
+  yield sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+  yield sseEvent('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn', stop_sequence: null },
+    usage: { output_tokens: outputTokens },
+  });
+  yield sseEvent('message_stop', { type: 'message_stop' });
 }

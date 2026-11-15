@@ -21,6 +21,7 @@ import {
 } from './lib/providers.ts';
 import {
   anthropicError,
+  anthropicEventsFromGemini,
   anthropicEventsFromOpenAI,
   anthropicModelList,
   anthropicToOpenAI,
@@ -28,6 +29,7 @@ import {
   geminiToOpenAIResponse,
   openAIError,
   openAIEventsFromAnthropic,
+  openAIEventsFromGemini,
   openAIModelList,
   openAIToAnthropic,
   openAIToAnthropicRequest,
@@ -218,10 +220,15 @@ async function callUpstreamOpenAI(
   if (wire === 'openai') {
     const headers: Record<string, string> = { 'content-type': 'application/json', ...auth };
     if (body.stream === true) headers.accept = 'text/event-stream';
+    const upstreamBody = {
+      ...body,
+      model: route.model.id,
+      ...(body.stream === true ? { stream_options: { include_usage: true } } : {}),
+    };
     const upstream = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ ...body, model: route.model.id }),
+      body: JSON.stringify(upstreamBody),
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
     if (!upstream.ok) {
@@ -386,10 +393,16 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
             'cache-control': 'no-cache',
             connection: 'keep-alive',
           });
+          const requestedModel = String(body.model ?? candidate.model.id);
           if (result.wire === 'openai') {
             await pipeStream(result.stream, res);
           } else if (result.wire === 'anthropic') {
-            for await (const chunk of openAIEventsFromAnthropic(result.stream, String(body.model ?? candidate.model.id))) {
+            for await (const chunk of openAIEventsFromAnthropic(result.stream, requestedModel)) {
+              res.write(chunk);
+            }
+            res.end();
+          } else if (result.wire === 'gemini') {
+            for await (const chunk of openAIEventsFromGemini(result.stream, requestedModel)) {
               res.write(chunk);
             }
             res.end();
@@ -448,6 +461,11 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
             await pipeStream(result.stream, res);
           } else if (result.wire === 'openai') {
             for await (const chunk of anthropicEventsFromOpenAI(result.stream, requestedModel)) {
+              res.write(chunk);
+            }
+            res.end();
+          } else if (result.wire === 'gemini') {
+            for await (const chunk of anthropicEventsFromGemini(result.stream, requestedModel)) {
               res.write(chunk);
             }
             res.end();
